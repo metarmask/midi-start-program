@@ -76,6 +76,16 @@ fn log_event(message: &str) -> Result<(), MidiStartPrgError> {
     Ok(())
 }
 
+fn suspend_system() -> Result<(), MidiStartPrgError> {
+    let status = Command::new("systemctl")
+        .args(["suspend", "--check-inhibitors=no"])
+        .status()?;
+    if !status.success() {
+        log_event("systemctl suspend failed (ignored)")?;
+    }
+    Ok(())
+}
+
 fn saved_volume_path() -> Result<PathBuf, MidiStartPrgError> {
     let base = env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -146,13 +156,15 @@ struct PianoteqProcess {
     child: Child,
     has_exited: bool,
     saved_volume: String,
-    _keep_awake: KeepAwake,
+    keep_awake: Option<KeepAwake>,
 }
 
 struct MidiState {
     process: Option<PianoteqProcess>,
     last_note_instant: Instant,
     last_msg_instant: Instant,
+    rightmost_count: u8,
+    force_reconnect: bool,
 }
 
 impl PianoteqProcess {
@@ -168,14 +180,18 @@ impl PianoteqProcess {
         Ok(PianoteqProcess {
             child: Command::new("/home/metarmask/.local/opt/pianoteq_stage_linux_v843/Pianoteq 8 STAGE/x86-64bit/Pianoteq 8 STAGE").spawn()?,
             has_exited: false,
-            _keep_awake: keepawake::Builder::default()
+            keep_awake: Some(keepawake::Builder::default()
                     .sleep(true)
                     .reason("Playing piano")
                     .app_name("Auto-Pianoteq")
                     .app_reverse_domain("pianoteq.auto")
-                    .create()?,
+                    .create()?),
             saved_volume
         })
+    }
+
+    fn release_keep_awake(&mut self) {
+        self.keep_awake = None;
     }
 
     fn kill(&mut self) -> Result<(), MidiStartPrgError> {
@@ -203,12 +219,33 @@ fn handle_msg(
     state: &mut MidiState,
     ctx: &mut ReceiverContext,
 ) -> Result<bool, MidiStartPrgError> {
+    const RIGHTMOST_C: u8 = 108;
+    const TRIGGER_NOTE: u8 = 106; // two semitones down
+
     let (msg, _) = MidiMsg::from_midi_with_context(bytes, ctx)?;
     state.last_msg_instant = Instant::now();
     match msg {
         ChannelVoice {
-            msg: NoteOn { .. }, ..
+            msg: NoteOn { note, velocity, .. },
+            ..
         } => {
+            if velocity > 0 {
+                if note == RIGHTMOST_C {
+                    state.rightmost_count = state.rightmost_count.saturating_add(1);
+                } else if note == TRIGGER_NOTE && state.rightmost_count >= 7 {
+                    log_event("suspend shortcut triggered")?;
+                    if let Some(process) = state.process.as_mut() {
+                        process.release_keep_awake();
+                        let _ = process.kill();
+                    }
+                    state.force_reconnect = true;
+                    state.rightmost_count = 0;
+                    suspend_system()?;
+                    return Ok(true);
+                } else {
+                    state.rightmost_count = 0;
+                }
+            }
             state.last_note_instant = Instant::now();
             if state.process.is_none() {
                 state.process = Some(PianoteqProcess::new()?);
@@ -266,6 +303,8 @@ fn main() -> Result<(), MidiStartPrgError> {
             process: None,
             last_note_instant: Instant::now(),
             last_msg_instant: Instant::now(),
+            rightmost_count: 0,
+            force_reconnect: false,
         }));
         let state_cb = Arc::clone(&state);
         let _conn = client.connect(
@@ -305,11 +344,16 @@ fn main() -> Result<(), MidiStartPrgError> {
                         log_event("shutdown signal received; exiting")?;
                         return Ok(());
                     }
-                    if let Ok(state) = state.lock()
-                        && state.last_msg_instant.elapsed() > Duration::from_secs(10)
-                    {
-                        log_event("midi idle timeout; reconnecting")?;
-                        break;
+                    if let Ok(mut state) = state.lock() {
+                        if state.force_reconnect {
+                            state.force_reconnect = false;
+                            log_event("forced reconnect requested; reconnecting")?;
+                            break;
+                        }
+                        if state.last_msg_instant.elapsed() > Duration::from_secs(10) {
+                            log_event("midi idle timeout; reconnecting")?;
+                            break;
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
