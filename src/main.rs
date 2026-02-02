@@ -1,29 +1,28 @@
 #![feature(exit_status_error)]
 #![feature(unix_send_signal)]
 
-
 use keepawake::KeepAwake;
+use midi_msg::ChannelVoiceMsg::NoteOn;
+use midi_msg::MidiMsg::ChannelVoice;
 use midi_msg::{MidiMsg, ReceiverContext};
 use midir::MidiInput;
+use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::flag;
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::process::ChildExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatusError};
-use std::time::Instant;
-use std::{thread::sleep, time::Duration};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
-use midi_msg::MidiMsg::ChannelVoice;
-use midi_msg::ChannelVoiceMsg::NoteOn;
-use thiserror::Error;
-use std::sync::mpsc::RecvTimeoutError;
-use std::fs::OpenOptions;
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
-use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
-use signal_hook::flag;
+use std::{thread::sleep, time::Duration};
+use thiserror::Error;
 
 fn get_pipewire_volume() -> Result<String, MidiStartPrgError> {
     let output = Command::new("wpctl")
@@ -44,12 +43,13 @@ fn set_pipewire_volume(volume: &str) -> Result<(), MidiStartPrgError> {
 }
 
 fn pause_media() -> Result<(), MidiStartPrgError> {
-    let output = Command::new("playerctl")
-        .args(["pause"])
-        .output()?;
+    let output = Command::new("playerctl").args(["pause"]).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        log_event(&format!("playerctl pause failed (ignored): {}", stderr.trim()))?;
+        log_event(&format!(
+            "playerctl pause failed (ignored): {}",
+            stderr.trim()
+        ))?;
         return Ok(());
     }
     Ok(())
@@ -66,7 +66,13 @@ fn log_event(message: &str) -> Result<(), MidiStartPrgError> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     use std::io::Write;
-    writeln!(file, "[{}.{:03}] {}", now.as_secs(), now.subsec_millis(), message)?;
+    writeln!(
+        file,
+        "[{}.{:03}] {}",
+        now.as_secs(),
+        now.subsec_millis(),
+        message
+    )?;
     Ok(())
 }
 
@@ -74,16 +80,20 @@ fn saved_volume_path() -> Result<PathBuf, MidiStartPrgError> {
     let base = env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
-        .or_else(|| env::var_os("HOME").map(|home| {
-            let mut path = PathBuf::from(home);
-            path.push(".local/state");
-            path
-        }))
-        .or_else(|| env::var_os("HOME").map(|home| {
-            let mut path = PathBuf::from(home);
-            path.push(".config");
-            path
-        }))
+        .or_else(|| {
+            env::var_os("HOME").map(|home| {
+                let mut path = PathBuf::from(home);
+                path.push(".local/state");
+                path
+            })
+        })
+        .or_else(|| {
+            env::var_os("HOME").map(|home| {
+                let mut path = PathBuf::from(home);
+                path.push(".config");
+                path
+            })
+        })
         .unwrap_or_else(|| PathBuf::from("."));
 
     let path = base.join("midi-start-program");
@@ -129,7 +139,7 @@ pub enum MidiStartPrgError {
     #[error("tried to keep computer awake {0}")]
     KeepAwake(#[from] keepawake::Error),
     #[error("thread error {0}")]
-    ThreadError(#[from] std::sync::mpsc::RecvError)
+    ThreadError(#[from] std::sync::mpsc::RecvError),
 }
 
 struct PianoteqProcess {
@@ -188,21 +198,31 @@ impl PianoteqProcess {
     }
 }
 
-fn handle_msg(bytes: &[u8], state: &mut MidiState, ctx: &mut ReceiverContext) -> Result<bool, MidiStartPrgError> {
+fn handle_msg(
+    bytes: &[u8],
+    state: &mut MidiState,
+    ctx: &mut ReceiverContext,
+) -> Result<bool, MidiStartPrgError> {
     let (msg, _) = MidiMsg::from_midi_with_context(bytes, ctx)?;
     state.last_msg_instant = Instant::now();
     match msg {
-        ChannelVoice{ msg: NoteOn {..}, .. } => {
+        ChannelVoice {
+            msg: NoteOn { .. }, ..
+        } => {
             state.last_note_instant = Instant::now();
             if state.process.is_none() {
                 state.process = Some(PianoteqProcess::new()?);
             }
         }
         MidiMsg::SystemRealTime { .. } => {
-            if state.last_note_instant.elapsed() > Duration::from_mins(3) && let Some(process) = state.process.as_mut() {
+            if state.last_note_instant.elapsed() > Duration::from_mins(3)
+                && let Some(process) = state.process.as_mut()
+            {
                 process.kill()?;
             }
-            if let Some(p) = state.process.as_mut() && p.check_is_exited()? {
+            if let Some(p) = state.process.as_mut()
+                && p.check_is_exited()?
+            {
                 state.process = None;
             }
         }
@@ -248,17 +268,22 @@ fn main() -> Result<(), MidiStartPrgError> {
             last_msg_instant: Instant::now(),
         }));
         let state_cb = Arc::clone(&state);
-        let _conn = client.connect(&port, &port_name, move |_, bytes, ()| {
-            let mut state = match state_cb.lock() {
-                Ok(state) => state,
-                Err(_) => return,
-            };
-            match handle_msg(bytes, &mut state,  &mut ctx) {
-                Ok(true) => {}
-                Ok(false) => tx.send(Ok(())).unwrap(),
-                Err(err) => tx.send(Err(err)).unwrap()
-            }
-        }, ())?;
+        let _conn = client.connect(
+            &port,
+            &port_name,
+            move |_, bytes, ()| {
+                let mut state = match state_cb.lock() {
+                    Ok(state) => state,
+                    Err(_) => return,
+                };
+                match handle_msg(bytes, &mut state, &mut ctx) {
+                    Ok(true) => {}
+                    Ok(false) => tx.send(Ok(())).unwrap(),
+                    Err(err) => tx.send(Err(err)).unwrap(),
+                }
+            },
+            (),
+        )?;
 
         loop {
             match rx.recv_timeout(Duration::from_secs(3)) {
@@ -273,17 +298,19 @@ fn main() -> Result<(), MidiStartPrgError> {
                 Err(RecvTimeoutError::Timeout) => {
                     if shutdown.load(Ordering::Relaxed) {
                         if let Ok(mut state) = state.lock()
-                            && let Some(process) = state.process.as_mut() {
-                                let _ = process.kill();
-                            }
+                            && let Some(process) = state.process.as_mut()
+                        {
+                            let _ = process.kill();
+                        }
                         log_event("shutdown signal received; exiting")?;
                         return Ok(());
                     }
                     if let Ok(state) = state.lock()
-                        && state.last_msg_instant.elapsed() > Duration::from_secs(10) {
-                            log_event("midi idle timeout; reconnecting")?;
-                            break;
-                        }
+                        && state.last_msg_instant.elapsed() > Duration::from_secs(10)
+                    {
+                        log_event("midi idle timeout; reconnecting")?;
+                        break;
+                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     log_event("midi channel disconnected; reconnecting")?;
