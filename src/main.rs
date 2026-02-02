@@ -1,0 +1,262 @@
+#![feature(exit_status_error)]
+#![feature(unix_send_signal)]
+
+
+use keepawake::KeepAwake;
+use midi_msg::{MidiMsg, ReceiverContext};
+use midir::MidiInput;
+use std::env;
+use std::fs;
+use std::io;
+use std::os::unix::process::ChildExt;
+use std::path::PathBuf;
+use std::process::{Child, Command, ExitStatusError};
+use std::time::Instant;
+use std::{thread::sleep, time::Duration};
+use std::sync::mpsc::channel;
+use midi_msg::MidiMsg::ChannelVoice;
+use midi_msg::ChannelVoiceMsg::NoteOn;
+use thiserror::Error;
+use std::sync::mpsc::RecvTimeoutError;
+use std::fs::OpenOptions;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn get_pipewire_volume() -> Result<String, MidiStartPrgError> {
+    let output = Command::new("wpctl")
+        .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
+        .output()?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn set_pipewire_volume(volume: &str) -> Result<(), MidiStartPrgError> {
+    // Parse volume - handle both "Volume: 0.50" format and plain "1.0" format
+    let vol_str = volume.split_whitespace().nth(1).unwrap_or(volume);
+
+    let output = Command::new("wpctl")
+        .args(["set-volume", "@DEFAULT_AUDIO_SINK@", vol_str])
+        .status()?;
+    output.exit_ok()?;
+    Ok(())
+}
+
+fn pause_media() -> Result<(), MidiStartPrgError> {
+    let output = Command::new("playerctl")
+        .args(["play-pause"])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log_event(&format!("playerctl play-pause failed (ignored): {}", stderr.trim()))?;
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn log_event(message: &str) -> Result<(), MidiStartPrgError> {
+    let path = saved_volume_path()?
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("log");
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    use std::io::Write;
+    writeln!(file, "[{}.{:03}] {}", now.as_secs(), now.subsec_millis(), message)?;
+    Ok(())
+}
+
+fn saved_volume_path() -> Result<PathBuf, MidiStartPrgError> {
+    let base = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
+        .or_else(|| env::var_os("HOME").map(|home| {
+            let mut path = PathBuf::from(home);
+            path.push(".local/state");
+            path
+        }))
+        .or_else(|| env::var_os("HOME").map(|home| {
+            let mut path = PathBuf::from(home);
+            path.push(".config");
+            path
+        }))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let path = base.join("midi-start-program");
+    fs::create_dir_all(&path)?;
+    Ok(path.join("volume"))
+}
+
+fn load_saved_volume() -> Result<Option<String>, MidiStartPrgError> {
+    let path = saved_volume_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(path)?;
+    let volume = contents.trim();
+    if volume.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(volume.to_string()))
+    }
+}
+
+fn persist_volume(volume: &str) -> Result<(), MidiStartPrgError> {
+    let path = saved_volume_path()?;
+    fs::write(path, volume.split_whitespace().nth(1).unwrap_or(volume))?;
+    Ok(())
+}
+
+#[derive(Error, Debug)]
+pub enum MidiStartPrgError {
+    #[error("somethingy io-y {0}")]
+    IoError(#[from] io::Error),
+    #[error("midi parsing error {0}")]
+    MidiParse(#[from] midi_msg::ParseError),
+    #[error("midi init error {0}")]
+    MidiInit(#[from] midir::InitError),
+    #[error("midi init error while getting port info {0}")]
+    MidiInitPort(#[from] midir::PortInfoError),
+    #[error("midi connection error while getting port info {0}")]
+    MidiConnect(#[from] midir::ConnectError<MidiInput>),
+    #[error("process exited unsucessfully {0}")]
+    ExitStatusError(#[from] ExitStatusError),
+    #[error("tried to keep computer awake {0}")]
+    KeepAwake(#[from] keepawake::Error),
+    #[error("thread error {0}")]
+    ThreadError(#[from] std::sync::mpsc::RecvError)
+}
+
+struct PianoteqProcess {
+    child: Child,
+    has_exited: bool,
+    saved_volume: String,
+    _keep_awake: KeepAwake,
+}
+
+impl PianoteqProcess {
+    fn new() -> Result<Self, MidiStartPrgError> {
+        let saved_volume = get_pipewire_volume()?;
+
+        log_event("spawning Pianoteq")?;
+        pause_media()?;
+        if let Some(volume) = load_saved_volume()? {
+            set_pipewire_volume(&volume)?;
+        }
+        println!("Spawning...");
+        Ok(PianoteqProcess {
+            child: Command::new("/home/metarmask/.local/opt/pianoteq_stage_linux_v843/Pianoteq 8 STAGE/x86-64bit/Pianoteq 8 STAGE").spawn()?,
+            has_exited: false,
+            _keep_awake: keepawake::Builder::default()
+                    .sleep(true)
+                    .reason("Playing piano")
+                    .app_name("Auto-Pianoteq")
+                    .app_reverse_domain("pianoteq.auto")
+                    .create()?,
+            saved_volume
+        })
+    }
+
+    fn kill(&mut self) -> Result<(), MidiStartPrgError> {
+        log_event("sending SIGTERM to Pianoteq")?;
+        println!("Kill(15)ing");
+        self.child.send_signal(15).map_err(Into::into)
+        // self.child.kill().map_err(Into::into)
+    }
+
+    fn check_is_exited(&mut self) -> Result<bool, MidiStartPrgError> {
+        if !self.has_exited && self.child.try_wait()?.is_some() {
+            self.has_exited = true;
+
+            log_event("Pianoteq exited; restoring volume")?;
+            let current_volume = get_pipewire_volume()?;
+            persist_volume(&current_volume)?;
+            set_pipewire_volume(&self.saved_volume)?;
+        }
+        Ok(self.has_exited)
+    }
+}
+
+fn handle_msg(bytes: &[u8], process: &mut Option<PianoteqProcess>, ctx: &mut ReceiverContext, last_note_instant: &mut Instant, last_msg_instant: &mut Instant) -> Result<bool, MidiStartPrgError> {
+    let (msg, _) = MidiMsg::from_midi_with_context(bytes, ctx)?;
+    *last_msg_instant = Instant::now();
+    match msg {
+        ChannelVoice{ msg: NoteOn {..}, .. } => {
+            *last_note_instant = Instant::now();
+            if process.is_none() {
+                *process = Some(PianoteqProcess::new()?);
+            }
+        }
+        MidiMsg::SystemRealTime { .. } => {
+            if last_note_instant.elapsed() > Duration::from_mins(3) && let Some(process) = process {
+                process.kill()?;
+            }
+            if let Some(p) = process && p.check_is_exited()? {
+                *process = None;
+            }
+        }
+        _ => {}
+    }
+    Ok(true)
+}
+
+fn main() -> Result<(), MidiStartPrgError> {
+    log_event("startup")?;
+    loop {
+        let client = MidiInput::new("I am client")?;
+        let ports = client.ports();
+        let mut found_port = None;
+        for port in ports {
+            let port_name = client.port_name(&port)?;
+            if port_name.starts_with("Digital Piano") {
+                found_port = Some((port, port_name));
+                break;
+            }
+        }
+
+        let Some((port, port_name)) = found_port else {
+            log_event("no matching MIDI port; retrying")?;
+            sleep(Duration::from_secs(2));
+            continue;
+        };
+
+        log_event(&format!("connecting to {}", port_name))?;
+        let mut ctx = ReceiverContext::new();
+        let (tx, rx) = channel::<Result<(), MidiStartPrgError>>();
+        let mut process: Option<PianoteqProcess> = None;
+        let mut last_note_instant = Instant::now();
+        let mut last_msg_instant = Instant::now();
+        let _conn = client.connect(&port, &port_name, move |_, bytes, ()| {
+            match handle_msg(bytes, &mut process,  &mut ctx, &mut last_note_instant, &mut last_msg_instant) {
+                Ok(true) => {}
+                Ok(false) => tx.send(Ok(())).unwrap(),
+                Err(err) => tx.send(Err(err)).unwrap()
+            }
+        }, ())?;
+
+        loop {
+            match rx.recv_timeout(Duration::from_secs(3)) {
+                Ok(Ok(())) => {
+                    log_event("connection requested shutdown")?;
+                    break;
+                }
+                Ok(Err(err)) => {
+                    log_event(&format!("midi error: {}", err))?;
+                    break;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if last_msg_instant.elapsed() > Duration::from_secs(10) {
+                        log_event("midi idle timeout; reconnecting")?;
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    log_event("midi channel disconnected; reconnecting")?;
+                    break;
+                }
+            }
+        }
+
+        sleep(Duration::from_secs(1));
+    }
+}

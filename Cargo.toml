@@ -1,0 +1,17 @@
+[package]
+name = "midi-start-program"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+midi-msg = "0.8.0"
+midir = "0.10.2"
+thiserror = "2.0.16"
+keepawake = "0.5.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
