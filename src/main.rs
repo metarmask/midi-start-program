@@ -14,12 +14,16 @@ use std::process::{Child, Command, ExitStatusError};
 use std::time::Instant;
 use std::{thread::sleep, time::Duration};
 use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use midi_msg::MidiMsg::ChannelVoice;
 use midi_msg::ChannelVoiceMsg::NoteOn;
 use thiserror::Error;
 use std::sync::mpsc::RecvTimeoutError;
 use std::fs::OpenOptions;
 use std::time::{SystemTime, UNIX_EPOCH};
+use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::flag;
 
 fn get_pipewire_volume() -> Result<String, MidiStartPrgError> {
     let output = Command::new("wpctl")
@@ -41,17 +45,18 @@ fn set_pipewire_volume(volume: &str) -> Result<(), MidiStartPrgError> {
 
 fn pause_media() -> Result<(), MidiStartPrgError> {
     let output = Command::new("playerctl")
-        .args(["play-pause"])
+        .args(["pause"])
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        log_event(&format!("playerctl play-pause failed (ignored): {}", stderr.trim()))?;
+        log_event(&format!("playerctl pause failed (ignored): {}", stderr.trim()))?;
         return Ok(());
     }
     Ok(())
 }
 
 fn log_event(message: &str) -> Result<(), MidiStartPrgError> {
+    eprintln!("{}", message);
     let path = saved_volume_path()?
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
@@ -134,6 +139,12 @@ struct PianoteqProcess {
     _keep_awake: KeepAwake,
 }
 
+struct MidiState {
+    process: Option<PianoteqProcess>,
+    last_note_instant: Instant,
+    last_msg_instant: Instant,
+}
+
 impl PianoteqProcess {
     fn new() -> Result<Self, MidiStartPrgError> {
         let saved_volume = get_pipewire_volume()?;
@@ -177,22 +188,22 @@ impl PianoteqProcess {
     }
 }
 
-fn handle_msg(bytes: &[u8], process: &mut Option<PianoteqProcess>, ctx: &mut ReceiverContext, last_note_instant: &mut Instant, last_msg_instant: &mut Instant) -> Result<bool, MidiStartPrgError> {
+fn handle_msg(bytes: &[u8], state: &mut MidiState, ctx: &mut ReceiverContext) -> Result<bool, MidiStartPrgError> {
     let (msg, _) = MidiMsg::from_midi_with_context(bytes, ctx)?;
-    *last_msg_instant = Instant::now();
+    state.last_msg_instant = Instant::now();
     match msg {
         ChannelVoice{ msg: NoteOn {..}, .. } => {
-            *last_note_instant = Instant::now();
-            if process.is_none() {
-                *process = Some(PianoteqProcess::new()?);
+            state.last_note_instant = Instant::now();
+            if state.process.is_none() {
+                state.process = Some(PianoteqProcess::new()?);
             }
         }
         MidiMsg::SystemRealTime { .. } => {
-            if last_note_instant.elapsed() > Duration::from_mins(3) && let Some(process) = process {
+            if state.last_note_instant.elapsed() > Duration::from_mins(3) && let Some(process) = state.process.as_mut() {
                 process.kill()?;
             }
-            if let Some(p) = process && p.check_is_exited()? {
-                *process = None;
+            if let Some(p) = state.process.as_mut() && p.check_is_exited()? {
+                state.process = None;
             }
         }
         _ => {}
@@ -202,7 +213,15 @@ fn handle_msg(bytes: &[u8], process: &mut Option<PianoteqProcess>, ctx: &mut Rec
 
 fn main() -> Result<(), MidiStartPrgError> {
     log_event("startup")?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    flag::register(SIGTERM, Arc::clone(&shutdown))?;
+    flag::register(SIGINT, Arc::clone(&shutdown))?;
+    flag::register(SIGHUP, Arc::clone(&shutdown))?;
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            log_event("shutdown signal received; exiting")?;
+            return Ok(());
+        }
         let client = MidiInput::new("I am client")?;
         let ports = client.ports();
         let mut found_port = None;
@@ -223,11 +242,18 @@ fn main() -> Result<(), MidiStartPrgError> {
         log_event(&format!("connecting to {}", port_name))?;
         let mut ctx = ReceiverContext::new();
         let (tx, rx) = channel::<Result<(), MidiStartPrgError>>();
-        let mut process: Option<PianoteqProcess> = None;
-        let mut last_note_instant = Instant::now();
-        let mut last_msg_instant = Instant::now();
+        let state = Arc::new(Mutex::new(MidiState {
+            process: None,
+            last_note_instant: Instant::now(),
+            last_msg_instant: Instant::now(),
+        }));
+        let state_cb = Arc::clone(&state);
         let _conn = client.connect(&port, &port_name, move |_, bytes, ()| {
-            match handle_msg(bytes, &mut process,  &mut ctx, &mut last_note_instant, &mut last_msg_instant) {
+            let mut state = match state_cb.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            match handle_msg(bytes, &mut state,  &mut ctx) {
                 Ok(true) => {}
                 Ok(false) => tx.send(Ok(())).unwrap(),
                 Err(err) => tx.send(Err(err)).unwrap()
@@ -245,10 +271,19 @@ fn main() -> Result<(), MidiStartPrgError> {
                     break;
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    if last_msg_instant.elapsed() > Duration::from_secs(10) {
-                        log_event("midi idle timeout; reconnecting")?;
-                        break;
+                    if shutdown.load(Ordering::Relaxed) {
+                        if let Ok(mut state) = state.lock()
+                            && let Some(process) = state.process.as_mut() {
+                                let _ = process.kill();
+                            }
+                        log_event("shutdown signal received; exiting")?;
+                        return Ok(());
                     }
+                    if let Ok(state) = state.lock()
+                        && state.last_msg_instant.elapsed() > Duration::from_secs(10) {
+                            log_event("midi idle timeout; reconnecting")?;
+                            break;
+                        }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     log_event("midi channel disconnected; reconnecting")?;

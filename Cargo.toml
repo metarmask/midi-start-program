@@ -8,6 +8,7 @@ midi-msg = "0.8.0"
 midir = "0.10.2"
 thiserror = "2.0.16"
 keepawake = "0.5.1"
+signal-hook = "0.3.17"
 
 [profile.release]
 opt-level = 3
