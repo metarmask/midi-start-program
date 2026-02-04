@@ -3,7 +3,7 @@ Description=MIDI Start program
 
 [Service]
 ExecStart=/home/metarmask/dev/midi-start-program/target/release/midi-start-program
-Restart=on-failure
+Restart=no
 WorkingDirectory=/home/metarmask/
 KillMode=control-group
 #Environment="ENV_VAR=value"

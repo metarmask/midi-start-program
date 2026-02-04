@@ -156,7 +156,7 @@ struct PianoteqProcess {
     child: Child,
     has_exited: bool,
     saved_volume: String,
-    keep_awake: Option<KeepAwake>,
+    _keep_awake: KeepAwake,
 }
 
 struct MidiState {
@@ -165,6 +165,7 @@ struct MidiState {
     last_msg_instant: Instant,
     rightmost_count: u8,
     force_reconnect: bool,
+    suspend_on_exit: bool,
 }
 
 impl PianoteqProcess {
@@ -180,18 +181,14 @@ impl PianoteqProcess {
         Ok(PianoteqProcess {
             child: Command::new("/home/metarmask/.local/opt/pianoteq_stage_linux_v843/Pianoteq 8 STAGE/x86-64bit/Pianoteq 8 STAGE").spawn()?,
             has_exited: false,
-            keep_awake: Some(keepawake::Builder::default()
+            _keep_awake: keepawake::Builder::default()
                     .sleep(true)
                     .reason("Playing piano")
                     .app_name("Auto-Pianoteq")
                     .app_reverse_domain("pianoteq.auto")
-                    .create()?),
+                    .create()?,
             saved_volume
         })
-    }
-
-    fn release_keep_awake(&mut self) {
-        self.keep_awake = None;
     }
 
     fn kill(&mut self) -> Result<(), MidiStartPrgError> {
@@ -211,6 +208,25 @@ impl PianoteqProcess {
             set_pipewire_volume(&self.saved_volume)?;
         }
         Ok(self.has_exited)
+    }
+}
+
+impl Drop for PianoteqProcess {
+    fn drop(&mut self) {
+        if self.has_exited {
+            return;
+        }
+        match self.child.try_wait() {
+            Ok(Some(_)) => {
+                self.has_exited = true;
+            }
+            Ok(None) => {
+                panic!("PianoteqProcess dropped while Pianoteq is still running");
+            }
+            Err(err) => {
+                panic!("PianoteqProcess drop failed to check child status: {err}");
+            }
+        }
     }
 }
 
@@ -235,12 +251,11 @@ fn handle_msg(
                 } else if note == TRIGGER_NOTE && state.rightmost_count >= 7 {
                     log_event("suspend shortcut triggered")?;
                     if let Some(process) = state.process.as_mut() {
-                        process.release_keep_awake();
                         let _ = process.kill();
                     }
+                    state.suspend_on_exit = true;
                     state.force_reconnect = true;
                     state.rightmost_count = 0;
-                    suspend_system()?;
                     return Ok(true);
                 } else {
                     state.rightmost_count = 0;
@@ -261,6 +276,10 @@ fn handle_msg(
                 && p.check_is_exited()?
             {
                 state.process = None;
+                if state.suspend_on_exit {
+                    state.suspend_on_exit = false;
+                    suspend_system()?;
+                }
             }
         }
         _ => {}
@@ -274,6 +293,14 @@ fn main() -> Result<(), MidiStartPrgError> {
     flag::register(SIGTERM, Arc::clone(&shutdown))?;
     flag::register(SIGINT, Arc::clone(&shutdown))?;
     flag::register(SIGHUP, Arc::clone(&shutdown))?;
+    let state = Arc::new(Mutex::new(MidiState {
+        process: None,
+        last_note_instant: Instant::now(),
+        last_msg_instant: Instant::now(),
+        rightmost_count: 0,
+        force_reconnect: false,
+        suspend_on_exit: false,
+    }));
     loop {
         if shutdown.load(Ordering::Relaxed) {
             log_event("shutdown signal received; exiting")?;
@@ -299,13 +326,10 @@ fn main() -> Result<(), MidiStartPrgError> {
         log_event(&format!("connecting to {}", port_name))?;
         let mut ctx = ReceiverContext::new();
         let (tx, rx) = channel::<Result<(), MidiStartPrgError>>();
-        let state = Arc::new(Mutex::new(MidiState {
-            process: None,
-            last_note_instant: Instant::now(),
-            last_msg_instant: Instant::now(),
-            rightmost_count: 0,
-            force_reconnect: false,
-        }));
+        if let Ok(mut state) = state.lock() {
+            state.last_msg_instant = Instant::now();
+            state.rightmost_count = 0;
+        }
         let state_cb = Arc::clone(&state);
         let _conn = client.connect(
             &port,
