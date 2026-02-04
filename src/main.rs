@@ -10,7 +10,7 @@ use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::flag;
 use std::io;
 use std::os::unix::process::ChildExt;
-use std::process::{Child, Command, ExitStatusError};
+use std::process::{Child, Command, ExitStatusError, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::channel;
@@ -52,16 +52,17 @@ pub enum MidiStartPrgError {
 }
 
 fn pause_media() -> Result<(), MidiStartPrgError> {
-    let output = Command::new("playerctl").args(["pause"]).output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        println!("playerctl pause failed (ignored): {}", stderr.trim());
-        return Ok(());
-    }
-    Ok(())
+    Ok(Command::new("playerctl")
+        .args(["pause"])
+        .stderr(Stdio::inherit())
+        .output()?
+        .exit_ok()
+        .map(|_| ())?)
 }
 
 fn suspend_system() -> Result<(), MidiStartPrgError> {
+    // TODO: This is to make sure messages reach the piano before, maybe make it less arbitrary
+    sleep(Duration::from_millis(500));
     let status = Command::new("systemctl")
         .args(["suspend", "--check-inhibitors=no"])
         .status()?;
@@ -82,7 +83,6 @@ struct MidiState {
     last_note_instant: Instant,
     last_msg_instant: Instant,
     rightmost_count: u8,
-    force_reconnect: bool,
     suspend_on_exit: bool,
     midi_out: Option<MidiOut>,
     volume: Volume,
@@ -158,7 +158,6 @@ fn handle_msg(
                         let _ = process.kill();
                     }
                     state.suspend_on_exit = true;
-                    // state.force_reconnect = true;
                     state.rightmost_count = 0;
                     return Ok(true);
                 } else {
@@ -172,13 +171,16 @@ fn handle_msg(
                     midi_out.send_note(START_NOTE, START_VELOCITY, true)?;
                     midi_out.send_note(START_NOTE, START_VELOCITY, false)?;
                 }
-                pause_media()?;
-                state.volume.set_swapped(true)?;
+                if pause_media().is_ok() {
+                    state.volume.set_swapped(true)?;
+                } else {
+                    println!("playerctl pause failed, not swapping volume");
+                }
                 state.process = Some(PianoteqProcess::new()?);
             }
         }
         MidiMsg::SystemRealTime { .. } => {
-            if state.last_note_instant.elapsed() > Duration::from_mins(3)
+            if state.last_note_instant.elapsed() > Duration::from_secs(10)
                 && let Some(process) = state.process.as_mut()
             {
                 process.kill()?;
@@ -187,10 +189,10 @@ fn handle_msg(
                 && p.check_is_exited()?
             {
                 state.process = None;
+                state.volume.set_swapped(false)?;
                 if let Some(midi_out) = &mut state.midi_out {
                     midi_out.set_local_control(true)?;
                 }
-                state.volume.set_swapped(false)?;
                 if state.suspend_on_exit {
                     state.suspend_on_exit = false;
                     suspend_system()?;
@@ -214,7 +216,6 @@ fn main() -> Result<(), MidiStartPrgError> {
         last_note_instant: Instant::now(),
         last_msg_instant: Instant::now(),
         rightmost_count: 0,
-        force_reconnect: false,
         suspend_on_exit: false,
         midi_out: None,
         volume: Volume::new(&xdg::BaseDirectories::with_prefix("midi-start-program"))?,
@@ -290,16 +291,11 @@ fn main() -> Result<(), MidiStartPrgError> {
                         println!("shutdown signal received; exiting");
                         return Ok(());
                     }
-                    if let Ok(mut state) = state.lock() {
-                        if state.force_reconnect {
-                            state.force_reconnect = false;
-                            println!("forced reconnect requested; reconnecting");
-                            break;
-                        }
-                        if state.last_msg_instant.elapsed() > Duration::from_secs(10) {
-                            println!("midi idle timeout; reconnecting");
-                            break;
-                        }
+                    if let Ok(state) = state.lock()
+                        && state.last_msg_instant.elapsed() > Duration::from_secs(10)
+                    {
+                        println!("midi idle timeout; reconnecting");
+                        break;
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
