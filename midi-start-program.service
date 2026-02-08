@@ -2,7 +2,7 @@
 Description=MIDI Start program
 
 [Service]
-ExecStart=/home/metarmask/dev/midi-start-program/target/release/midi-start-program
+ExecStart=/home/metarmask/dev/midi-start-program/target/release/midi-start-program --program "/home/metarmask/.local/opt/pianoteq_stage_linux_v843/Pianoteq 8 STAGE/x86-64bit/Pianoteq 8 STAGE" --idle 180
 Restart=no
 WorkingDirectory=/home/metarmask/
 KillMode=control-group

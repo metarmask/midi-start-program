@@ -1,6 +1,7 @@
 #![feature(exit_status_error)]
 #![feature(unix_send_signal)]
 
+use clap::Parser;
 use keepawake::KeepAwake;
 use midi_msg::ChannelVoiceMsg::NoteOn;
 use midi_msg::MidiMsg::ChannelVoice;
@@ -24,6 +25,29 @@ use crate::volume::Volume;
 
 mod midi_out;
 mod volume;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "midi-start-program",
+    version,
+    about = "Start Pianoteq on MIDI activity"
+)]
+struct Args {
+    #[arg(
+        long,
+        default_value = "Digital Piano",
+        help = "Prefix of the MIDI port name to connect to"
+    )]
+    device_prefix: String,
+    #[arg(long, help = "Path to the Pianoteq executable")]
+    program: String,
+    #[arg(
+        long,
+        default_value_t = 180,
+        help = "Idle seconds before killing Pianoteq"
+    )]
+    idle: u64,
+}
 
 #[derive(Error, Debug)]
 pub enum MidiStartPrgError {
@@ -80,25 +104,29 @@ struct PianoteqProcess {
 
 struct MidiState {
     process: Option<PianoteqProcess>,
+    starting: bool,
     last_note_instant: Instant,
     last_msg_instant: Instant,
     rightmost_count: u8,
     suspend_on_exit: bool,
     midi_out: Option<MidiOut>,
     volume: Volume,
+    program: String,
+    idle_timeout: Duration,
 }
 
 impl PianoteqProcess {
-    fn new() -> Result<Self, MidiStartPrgError> {
+    fn new(executable: &str) -> Result<Self, MidiStartPrgError> {
+        let child = Command::new(executable).spawn()?;
         Ok(PianoteqProcess {
-            child: Command::new("/home/metarmask/.local/opt/pianoteq_stage_linux_v843/Pianoteq 8 STAGE/x86-64bit/Pianoteq 8 STAGE").spawn()?,
+            child,
             has_exited: false,
             _keep_awake: keepawake::Builder::default()
-                    .sleep(true)
-                    .reason("Playing piano")
-                    .app_name("Auto-Pianoteq")
-                    .app_reverse_domain("pianoteq.auto")
-                    .create()?
+                .sleep(true)
+                .reason("Playing piano")
+                .app_name("Auto-Pianoteq")
+                .app_reverse_domain("pianoteq.auto")
+                .create()?,
         })
     }
 
@@ -107,7 +135,10 @@ impl PianoteqProcess {
     }
 
     fn check_is_exited(&mut self) -> Result<bool, MidiStartPrgError> {
-        if !self.has_exited && self.child.try_wait()?.is_some() {
+        if self.has_exited {
+            return Ok(true);
+        }
+        if self.child.try_wait()?.is_some() {
             self.has_exited = true;
         }
         Ok(self.has_exited)
@@ -165,22 +196,28 @@ fn handle_msg(
                 }
             }
             state.last_note_instant = Instant::now();
-            if state.process.is_none() {
-                if let Some(midi_out) = &mut state.midi_out {
-                    midi_out.set_local_control(false)?;
-                    midi_out.send_note(START_NOTE, START_VELOCITY, true)?;
-                    midi_out.send_note(START_NOTE, START_VELOCITY, false)?;
-                }
-                if pause_media().is_ok() {
-                    state.volume.set_swapped(true)?;
-                } else {
-                    println!("playerctl pause failed, not swapping volume");
-                }
-                state.process = Some(PianoteqProcess::new()?);
+            if state.process.is_none() && !state.starting {
+                state.starting = true;
+                let start_result = (|| -> Result<(), MidiStartPrgError> {
+                    if let Some(midi_out) = &mut state.midi_out {
+                        midi_out.set_local_control(false)?;
+                        midi_out.send_note(START_NOTE, START_VELOCITY, true)?;
+                        midi_out.send_note(START_NOTE, START_VELOCITY, false)?;
+                    }
+                    if pause_media().is_ok() {
+                        state.volume.set_swapped(true)?;
+                    } else {
+                        println!("playerctl pause failed, not swapping volume");
+                    }
+                    state.process = Some(PianoteqProcess::new(&state.program)?);
+                    Ok(())
+                })();
+                state.starting = false;
+                start_result?;
             }
         }
         MidiMsg::SystemRealTime { .. } => {
-            if state.last_note_instant.elapsed() > Duration::from_secs(10)
+            if state.last_note_instant.elapsed() > state.idle_timeout
                 && let Some(process) = state.process.as_mut()
             {
                 process.kill()?;
@@ -189,6 +226,7 @@ fn handle_msg(
                 && p.check_is_exited()?
             {
                 state.process = None;
+                state.starting = false;
                 state.volume.set_swapped(false)?;
                 if let Some(midi_out) = &mut state.midi_out {
                     midi_out.set_local_control(true)?;
@@ -205,7 +243,7 @@ fn handle_msg(
 }
 
 fn main() -> Result<(), MidiStartPrgError> {
-    const DEVICE_PREFIX: &str = "Digital Piano";
+    let args = Args::parse();
 
     let shutdown = Arc::new(AtomicBool::new(false));
     flag::register(SIGTERM, Arc::clone(&shutdown))?;
@@ -213,12 +251,15 @@ fn main() -> Result<(), MidiStartPrgError> {
     flag::register(SIGHUP, Arc::clone(&shutdown))?;
     let state = Arc::new(Mutex::new(MidiState {
         process: None,
+        starting: false,
         last_note_instant: Instant::now(),
         last_msg_instant: Instant::now(),
         rightmost_count: 0,
         suspend_on_exit: false,
         midi_out: None,
         volume: Volume::new(&xdg::BaseDirectories::with_prefix("midi-start-program"))?,
+        program: args.program,
+        idle_timeout: Duration::from_secs(args.idle),
     }));
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -230,7 +271,7 @@ fn main() -> Result<(), MidiStartPrgError> {
         let mut found_port = None;
         for port in ports {
             let port_name = client.port_name(&port)?;
-            if port_name.starts_with(DEVICE_PREFIX) {
+            if port_name.starts_with(&args.device_prefix) {
                 found_port = Some((port, port_name));
                 break;
             }
@@ -248,7 +289,7 @@ fn main() -> Result<(), MidiStartPrgError> {
         if let Ok(mut state) = state.lock() {
             state.last_msg_instant = Instant::now();
             state.rightmost_count = 0;
-            state.midi_out = MidiOut::open(DEVICE_PREFIX)?;
+            state.midi_out = MidiOut::open(&args.device_prefix)?;
             if state.midi_out.is_none() {
                 println!("no MIDI output port found");
             }
