@@ -1,27 +1,31 @@
 #![feature(exit_status_error)]
 #![feature(unix_send_signal)]
 
+use std::{
+    io,
+    os::unix::process::ChildExt,
+    process::{Child, Command, ExitStatusError},
+    result::Result as StdResult,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, channel},
+    },
+    thread::sleep,
+    time::{Duration, Instant},
+};
+
 use clap::Parser;
 use keepawake::KeepAwake;
-use midi_msg::ChannelVoiceMsg::NoteOn;
-use midi_msg::MidiMsg::ChannelVoice;
-use midi_msg::{MidiMsg, ReceiverContext};
+use midi_msg::{ChannelVoiceMsg::NoteOn, MidiMsg, MidiMsg::ChannelVoice, ReceiverContext};
 use midir::{MidiInput, MidiInputConnection, MidiOutput, SendError};
-use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
-use signal_hook::flag;
-use std::io;
-use std::os::unix::process::ChildExt;
-use std::process::{Child, Command, ExitStatusError};
-use std::result::Result as StdResult;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
-use std::time::Instant;
-use std::{thread::sleep, time::Duration};
+use signal_hook::{
+    consts::signal::{SIGHUP, SIGINT, SIGTERM},
+    flag,
+};
 use thiserror::Error;
 
-use crate::midi_out::MidiOut;
-use crate::volume::Volume;
+use crate::{midi_out::MidiOut, volume::Volume};
 
 mod midi_out;
 mod volume;
