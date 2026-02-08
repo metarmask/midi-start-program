@@ -104,7 +104,6 @@ struct PianoteqProcess {
 
 struct MidiState {
     process: Option<PianoteqProcess>,
-    starting: bool,
     last_note_instant: Instant,
     last_msg_instant: Instant,
     rightmost_count: u8,
@@ -164,6 +163,36 @@ impl Drop for PianoteqProcess {
     }
 }
 
+fn refresh_process_state(state: &mut MidiState) -> Result<(), MidiStartPrgError> {
+    let has_exited = if let Some(process) = state.process.as_mut() {
+        process.check_is_exited()?
+    } else {
+        false
+    };
+
+    if has_exited {
+        state.process = None;
+        state.volume.set_swapped(false)?;
+        if let Some(midi_out) = &mut state.midi_out {
+            midi_out.set_local_control(true)?;
+        }
+        if state.suspend_on_exit {
+            state.suspend_on_exit = false;
+            suspend_system()?;
+        }
+    }
+    Ok(())
+}
+
+fn enforce_idle_timeout(state: &mut MidiState) -> Result<(), MidiStartPrgError> {
+    if state.last_note_instant.elapsed() > state.idle_timeout
+        && let Some(process) = state.process.as_mut()
+    {
+        process.kill()?;
+    }
+    Ok(())
+}
+
 fn handle_msg(
     bytes: &[u8],
     state: &mut MidiState,
@@ -174,71 +203,59 @@ fn handle_msg(
     const START_NOTE: u8 = 60; // middle C
     const START_VELOCITY: u8 = 80;
 
+    refresh_process_state(state)?;
+
     let (msg, _) = MidiMsg::from_midi_with_context(bytes, ctx)?;
     state.last_msg_instant = Instant::now();
-    match msg {
-        ChannelVoice {
-            msg: NoteOn { note, velocity, .. },
-            ..
-        } => {
-            if velocity > 0 {
-                if note == RIGHTMOST_C {
-                    state.rightmost_count = state.rightmost_count.saturating_add(1);
-                } else if note == TRIGGER_NOTE && state.rightmost_count >= 7 {
-                    if let Some(process) = state.process.as_mut() {
-                        let _ = process.kill();
-                    }
-                    state.suspend_on_exit = true;
-                    state.rightmost_count = 0;
-                    return Ok(true);
-                } else {
-                    state.rightmost_count = 0;
+    if let ChannelVoice {
+        msg: NoteOn { note, velocity, .. },
+        ..
+    } = msg
+    {
+        if velocity > 0 {
+            if note == RIGHTMOST_C {
+                state.rightmost_count = state.rightmost_count.saturating_add(1);
+            } else if note == TRIGGER_NOTE && state.rightmost_count >= 7 {
+                if let Some(process) = state.process.as_mut() {
+                    let _ = process.kill();
                 }
-            }
-            state.last_note_instant = Instant::now();
-            if state.process.is_none() && !state.starting {
-                state.starting = true;
-                let start_result = (|| -> Result<(), MidiStartPrgError> {
-                    if let Some(midi_out) = &mut state.midi_out {
-                        midi_out.set_local_control(false)?;
-                        midi_out.send_note(START_NOTE, START_VELOCITY, true)?;
-                        midi_out.send_note(START_NOTE, START_VELOCITY, false)?;
-                    }
-                    if pause_media().is_ok() {
-                        state.volume.set_swapped(true)?;
-                    } else {
-                        println!("playerctl pause failed, not swapping volume");
-                    }
-                    state.process = Some(PianoteqProcess::new(&state.program)?);
-                    Ok(())
-                })();
-                state.starting = false;
-                start_result?;
+                state.suspend_on_exit = true;
+                state.rightmost_count = 0;
+                return Ok(true);
+            } else {
+                state.rightmost_count = 0;
             }
         }
-        MidiMsg::SystemRealTime { .. } => {
-            if state.last_note_instant.elapsed() > state.idle_timeout
-                && let Some(process) = state.process.as_mut()
-            {
-                process.kill()?;
-            }
-            if let Some(p) = state.process.as_mut()
-                && p.check_is_exited()?
-            {
-                state.process = None;
-                state.starting = false;
-                state.volume.set_swapped(false)?;
+        state.last_note_instant = Instant::now();
+        if state.process.is_none() {
+            let mut volume_swapped = false;
+            let start_result = (|| -> Result<(), MidiStartPrgError> {
                 if let Some(midi_out) = &mut state.midi_out {
-                    midi_out.set_local_control(true)?;
+                    midi_out.set_local_control(false)?;
+                    midi_out.send_note(START_NOTE, START_VELOCITY, true)?;
+                    midi_out.send_note(START_NOTE, START_VELOCITY, false)?;
                 }
-                if state.suspend_on_exit {
-                    state.suspend_on_exit = false;
-                    suspend_system()?;
+                if pause_media().is_ok() {
+                    state.volume.set_swapped(true)?;
+                    volume_swapped = true;
+                } else {
+                    println!("playerctl pause failed, not swapping volume");
                 }
+                state.process = Some(PianoteqProcess::new(&state.program)?);
+                Ok(())
+            })();
+            if let Err(err) = start_result {
+                if volume_swapped {
+                    let _ = state.volume.set_swapped(false);
+                }
+                if let Some(midi_out) = &mut state.midi_out {
+                    let _ = midi_out.set_local_control(true);
+                }
+                return Err(err);
             }
         }
-        _ => {}
     }
+    enforce_idle_timeout(state)?;
     Ok(true)
 }
 
@@ -251,7 +268,6 @@ fn main() -> Result<(), MidiStartPrgError> {
     flag::register(SIGHUP, Arc::clone(&shutdown))?;
     let state = Arc::new(Mutex::new(MidiState {
         process: None,
-        starting: false,
         last_note_instant: Instant::now(),
         last_msg_instant: Instant::now(),
         rightmost_count: 0,
@@ -332,11 +348,13 @@ fn main() -> Result<(), MidiStartPrgError> {
                         println!("shutdown signal received; exiting");
                         return Ok(());
                     }
-                    if let Ok(state) = state.lock()
-                        && state.last_msg_instant.elapsed() > Duration::from_secs(10)
-                    {
-                        println!("midi idle timeout; reconnecting");
-                        break;
+                    if let Ok(mut state) = state.lock() {
+                        refresh_process_state(&mut state)?;
+                        enforce_idle_timeout(&mut state)?;
+                        if state.last_msg_instant.elapsed() > Duration::from_secs(10) {
+                            println!("midi idle timeout; reconnecting");
+                            break;
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
