@@ -34,7 +34,7 @@ mod volume;
 #[command(
     name = "midi-start-program",
     version,
-    about = "Start Pianoteq on MIDI activity"
+    about = "Start synth on MIDI activity"
 )]
 struct Args {
     #[arg(
@@ -43,12 +43,12 @@ struct Args {
         help = "Prefix of the MIDI port name to connect to"
     )]
     device_prefix: String,
-    #[arg(long, help = "Path to the Pianoteq executable")]
-    program: String,
+    #[arg(long, help = "Path to the synth executable")]
+    synth: String,
     #[arg(
         long,
         default_value_t = 180,
-        help = "Idle seconds before killing Pianoteq"
+        help = "Idle seconds before killing synth"
     )]
     idle: u64,
 }
@@ -131,7 +131,7 @@ fn pause_media() -> Result<()> {
 }
 
 fn systemctl_suspend() -> Result<()> {
-    // TODO: This is to make sure messages reach the piano before, maybe make it less arbitrary
+    // Don't suspend too quickly, or the local control message may not have time to arrive.
     sleep(Duration::from_millis(500));
     let status = Command::new("systemctl")
         .args(["suspend", "--check-inhibitors=no"])
@@ -140,23 +140,23 @@ fn systemctl_suspend() -> Result<()> {
     status.exit_ok().map_err(From::from)
 }
 
-struct PianoteqProcess {
+struct SynthProcess {
     child: Child,
     has_exited: bool,
     _keep_awake: KeepAwake,
 }
 
-impl PianoteqProcess {
+impl SynthProcess {
     fn new(executable: &str) -> Result<Self> {
         let child = Command::new(executable).spawn()?;
-        Ok(PianoteqProcess {
+        Ok(SynthProcess {
             child,
             has_exited: false,
             _keep_awake: keepawake::Builder::default()
                 .sleep(true)
-                .reason("Playing piano")
-                .app_name("Auto-Pianoteq")
-                .app_reverse_domain("pianoteq.auto")
+                .reason("Playing instrument")
+                .app_name("midi-start-program")
+                .app_reverse_domain("io.midi-start-program")
                 .create()?,
         })
     }
@@ -176,7 +176,7 @@ impl PianoteqProcess {
     }
 }
 
-impl Drop for PianoteqProcess {
+impl Drop for SynthProcess {
     fn drop(&mut self) {
         if !self.has_exited {
             let result = self.child.kill();
@@ -184,7 +184,7 @@ impl Drop for PianoteqProcess {
                 result.unwrap()
             } else if let Err(err) = result {
                 eprintln!(
-                    "killing in Drop for PianoteqProcess failed during panic: {:?}",
+                    "killing in Drop for SynthProcess failed during panic: {:?}",
                     err
                 )
             }
@@ -195,7 +195,7 @@ impl Drop for PianoteqProcess {
 struct App {
     args: Args,
     shutdown: Arc<AtomicBool>,
-    process: Option<PianoteqProcess>,
+    process: Option<SynthProcess>,
     midi: Option<MidiConnection>,
     volume: Volume,
     idle_timeout: Duration,
@@ -243,9 +243,9 @@ impl MidiConnection {
 
 impl App {
     fn touch_note(midi_out: &mut MidiOut, note: u8) -> Result<()> {
-        const START_VELOCITY: u8 = 80;
-        midi_out.send_note(note, START_VELOCITY, true)?;
-        midi_out.send_note(note, START_VELOCITY, false)?;
+        let velocity = 80;
+        midi_out.send_note(note, velocity, true)?;
+        midi_out.send_note(note, velocity, false)?;
         Ok(())
     }
 
@@ -254,16 +254,16 @@ impl App {
             return Ok(());
         }
         let start_result = (|| -> Result<()> {
-            if let Some(Some(midi_out)) = self.midi.as_mut().map(|a| a.midi_out.as_mut()) {
-                Self::touch_note(midi_out, 60)?;
-                midi_out.set_local_control(false)?;
-            }
             if pause_media().is_ok() {
                 self.volume.set_swapped(true)?;
             } else {
                 println!("playerctl pause failed, not swapping volume");
             }
-            self.process = Some(PianoteqProcess::new(&self.args.program)?);
+            self.process = Some(SynthProcess::new(&self.args.synth)?);
+            if let Some(Some(midi_out)) = self.midi.as_mut().map(|a| a.midi_out.as_mut()) {
+                Self::touch_note(midi_out, 60)?;
+                midi_out.set_local_control(false)?;
+            }
             Ok(())
         })();
         if let Err(err) = start_result {
@@ -377,7 +377,7 @@ impl App {
         while let Some(process) = &mut self.process
             && !process.check_has_exited()?
         {
-            println!("waiting for Pianoteq to exit");
+            println!("waiting for synth to exit");
             self.maybe_cleanup_process()?;
             sleep(Duration::from_millis(400));
         }

@@ -1,0 +1,11 @@
+[Unit]
+Description=MIDI synth auto-start service
+
+[Service]
+# Update both paths for your system before enabling this unit.
+ExecStart=midi-start-program --device-prefix "Digital Piano" --synth "/path/to/synth-executable" --idle 180
+WorkingDirectory=%h
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
