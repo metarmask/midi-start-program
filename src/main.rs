@@ -178,10 +178,6 @@ fn refresh_process_state(state: &mut MidiState) -> Result<(), MidiStartPrgError>
         if let Some(midi_out) = &mut state.midi_out {
             midi_out.set_local_control(true)?;
         }
-        if state.suspend_on_exit {
-            state.suspend_on_exit = false;
-            suspend_system()?;
-        }
     };
     Ok(())
 }
@@ -206,6 +202,7 @@ fn handle_msg(
     const START_VELOCITY: u8 = 80;
 
     refresh_process_state(state)?;
+    enforce_idle_timeout(state)?;
 
     let (msg, _) = MidiMsg::from_midi_with_context(bytes, ctx)?;
     state.last_msg_instant = Instant::now();
@@ -216,6 +213,10 @@ fn handle_msg(
     else {
         return Ok(true);
     };
+    // Required since connection loop exit is asynchronous
+    if state.suspend_on_exit {
+        return Ok(true);
+    }
     if velocity > 0 {
         if note == RIGHTMOST_C {
             state.rightmost_count = state.rightmost_count.saturating_add(1);
@@ -225,13 +226,12 @@ fn handle_msg(
             }
             state.suspend_on_exit = true;
             state.rightmost_count = 0;
-            return Ok(true);
+            return Ok(false);
         } else {
             state.rightmost_count = 0;
         }
     }
     state.last_note_instant = Instant::now();
-    enforce_idle_timeout(state)?;
     if state.process.is_some() {
         return Ok(true);
     }
@@ -315,23 +315,32 @@ fn main() -> Result<(), MidiStartPrgError> {
         let conn = client.connect(
             &port,
             &port_name,
-            move |_, bytes, (shutdown, state)| {
-                match handle_msg(bytes, state, &mut ctx) {
-                    Ok(true) => {}
-                    Ok(false) => tx.send(Ok(())).unwrap(),
-                    Err(err) => tx.send(Err(err)).unwrap(),
-                }
-                if shutdown.load(Ordering::Relaxed) {
-                    tx.send(Ok(())).unwrap()
-                }
+            move |_, bytes, (shutdown, state)| match handle_msg(bytes, state, &mut ctx) {
+                Ok(true) if shutdown.load(Ordering::Relaxed) => tx.send(Ok(())).unwrap(),
+                Ok(true) => (),
+                Ok(false) => tx.send(Ok(())).unwrap(),
+                Err(err) => tx.send(Err(err)).unwrap(),
             },
             (Arc::clone(&shutdown), state),
         )?;
+
         println!("connected");
+        // We assume that the midir library handles timeouts well??
         let closing_message = rx.recv()?;
         println!("closing message received");
         (_, (_, state)) = conn.close();
         println!("closed");
+        if state.suspend_on_exit {
+            state.suspend_on_exit = false;
+            while let Some(process) = &mut state.process
+                && !process.check_is_exited()?
+            {
+                println!("waiting for Pianoteq to exit");
+                sleep(Duration::from_millis(100));
+                refresh_process_state(&mut state)?;
+            }
+            suspend_system()?;
+        }
         refresh_process_state(&mut state)?;
         enforce_idle_timeout(&mut state)?;
         println!("checking closing message errors");
